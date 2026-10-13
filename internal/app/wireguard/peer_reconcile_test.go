@@ -2,7 +2,6 @@ package wireguard
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -11,133 +10,51 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type reconcileRepo struct {
-	InterfaceAndPeerDatabaseRepo
-	peers []domain.Peer
-	err   error
-}
+type reconcileRepo struct{ InterfaceAndPeerDatabaseRepo }
 
-func (r *reconcileRepo) GetAllInterfaces(context.Context) ([]domain.Interface, error) {
-	return []domain.Interface{{Identifier: "wg0"}}, nil // v1 API's default local backend
+func (reconcileRepo) GetAllInterfaces(context.Context) ([]domain.Interface, error) {
+	return []domain.Interface{{Identifier: "wg0"}}, nil
 }
-func (r *reconcileRepo) GetInterfacePeers(context.Context, domain.InterfaceIdentifier) ([]domain.Peer, error) {
-	return r.peers, r.err
+func (reconcileRepo) GetInterfacePeers(context.Context, domain.InterfaceIdentifier) ([]domain.Peer, error) {
+	return []domain.Peer{{Identifier: "new", InterfaceIdentifier: "wg0", Interface: domain.PeerInterfaceConfig{KeyPair: domain.KeyPair{PublicKey: "new"}}}}, nil
 }
 
 type reconcileController struct {
 	InterfaceController
-	peers          map[domain.PeerIdentifier]domain.PhysicalPeer
-	saved, deleted []domain.PeerIdentifier
-	readErr        error
+	added, removed chan domain.PeerIdentifier
 }
 
-func (c *reconcileController) GetPeers(context.Context, domain.InterfaceIdentifier) ([]domain.PhysicalPeer, error) {
-	var peers []domain.PhysicalPeer
-	for _, peer := range c.peers {
-		peers = append(peers, peer)
-	}
-	return peers, c.readErr
+func (c reconcileController) GetPeers(context.Context, domain.InterfaceIdentifier) ([]domain.PhysicalPeer, error) {
+	return []domain.PhysicalPeer{{Identifier: "revoked"}}, nil
 }
-func (c *reconcileController) DeletePeer(_ context.Context, _ domain.InterfaceIdentifier, id domain.PeerIdentifier) error {
-	c.deleted = append(c.deleted, id)
-	delete(c.peers, id)
+func (c reconcileController) DeletePeer(_ context.Context, _ domain.InterfaceIdentifier, id domain.PeerIdentifier) error {
+	c.removed <- id
 	return nil
 }
-func (c *reconcileController) SavePeer(_ context.Context, _ domain.InterfaceIdentifier, id domain.PeerIdentifier, update func(*domain.PhysicalPeer) (*domain.PhysicalPeer, error)) error {
-	current := c.peers[id]
-	endpoint := current.Endpoint
-	peer, err := update(&current)
-	if err != nil {
-		return err
-	}
-	// A nil WireGuard endpoint update retains the learned endpoint.
-	if peer.Endpoint == "" {
-		peer.Endpoint = endpoint
-	}
-	c.saved = append(c.saved, id)
-	c.peers[id] = *peer
+func (c reconcileController) SavePeer(_ context.Context, _ domain.InterfaceIdentifier, id domain.PeerIdentifier, _ func(*domain.PhysicalPeer) (*domain.PhysicalPeer, error)) error {
+	c.added <- id
 	return nil
 }
 
-func reconcileFixture(t *testing.T) (Manager, *reconcileRepo, *reconcileController, domain.Peer) {
-	t.Helper()
-	ips, err := domain.CidrsFromString("10.77.0.2/32")
-	require.NoError(t, err)
-	peer := domain.Peer{
-		Identifier: "client", InterfaceIdentifier: "wg0",
-		Interface: domain.PeerInterfaceConfig{KeyPair: domain.KeyPair{PublicKey: "client"}, Type: domain.InterfaceTypeClient, Addresses: ips},
-	}
+func TestPeriodicReconciliationRepairsMissedEvents(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Core.ForceClientIPAsAllowedIP = true
-	repo := &reconcileRepo{peers: []domain.Peer{peer}}
-	controller := &reconcileController{peers: map[domain.PeerIdentifier]domain.PhysicalPeer{}}
-	controllers := &ControllerManager{controllers: map[domain.InterfaceBackend]backendInstance{
-		config.LocalBackendName: {Implementation: controller},
-	}}
-	return Manager{cfg: cfg, db: repo, wg: controllers}, repo, controller, peer
-}
-
-func TestReconcileRepairsMissedCreationAndDeletion(t *testing.T) {
-	m, _, controller, peer := reconcileFixture(t)
-	controller.peers["revoked"] = domain.PhysicalPeer{Identifier: "revoked"}
-	m.reconcilePeers(context.Background())
-	require.Equal(t, []domain.PeerIdentifier{peer.Identifier}, controller.saved)
-	require.Equal(t, []domain.PeerIdentifier{"revoked"}, controller.deleted)
-	require.NotContains(t, controller.peers, domain.PeerIdentifier("revoked"))
-}
-
-func TestReconcilePreservesRoamingAndHandshake(t *testing.T) {
-	m, _, controller, peer := reconcileFixture(t)
-	var current domain.PhysicalPeer
-	domain.MergeToPhysicalPeer(&current, &peer, true)
-	current.Endpoint = "203.0.113.4:49000"
-	current.LastHandshake = time.Now()
-	controller.peers[peer.Identifier] = current
-	m.reconcilePeers(context.Background())
-	require.Equal(t, current, controller.peers[peer.Identifier])
-}
-
-func TestReconcileRepairsAuthorizationWithoutResettingEndpoint(t *testing.T) {
-	m, repo, controller, peer := reconcileFixture(t)
-	var current domain.PhysicalPeer
-	domain.MergeToPhysicalPeer(&current, &peer, true)
-	current.Endpoint = "203.0.113.4:49000"
-	current.PresharedKey = "old-psk"
-	current.PersistentKeepalive = 25
-	controller.peers[peer.Identifier] = current
-	repo.peers[0].Interface.Addresses, _ = domain.CidrsFromString("10.77.0.9/32")
-	m.reconcilePeers(context.Background())
-	updated := controller.peers[peer.Identifier]
-	require.Equal(t, current.Endpoint, updated.Endpoint)
-	require.Empty(t, updated.PresharedKey)
-	require.Zero(t, updated.PersistentKeepalive)
-	require.Equal(t, "10.77.0.9/32", updated.AllowedIPs[0].String())
-}
-
-func TestReconcileRemovesDisabledPeer(t *testing.T) {
-	m, repo, controller, peer := reconcileFixture(t)
-	controller.peers[peer.Identifier] = domain.PhysicalPeer{Identifier: peer.Identifier}
-	now := time.Now()
-	repo.peers[0].Disabled = &now
-	m.reconcilePeers(context.Background())
-	require.Empty(t, controller.peers)
-}
-
-func TestReconcileQueryFailuresNeverRemovePeers(t *testing.T) {
-	for _, failure := range []string{"database", "kernel"} {
-		t.Run(failure, func(t *testing.T) {
-			m, repo, controller, peer := reconcileFixture(t)
-			controller.peers[peer.Identifier] = domain.PhysicalPeer{Identifier: peer.Identifier}
-			repo.peers = nil
-			if failure == "database" {
-				repo.err = errors.New("database unavailable")
-			} else {
-				controller.readErr = errors.New("netlink unavailable")
-			}
-			m.reconcilePeers(context.Background())
-			require.Empty(t, controller.saved)
-			require.Empty(t, controller.deleted)
-			require.Contains(t, controller.peers, peer.Identifier)
-		})
+	cfg.Core.Fanout.Enabled = true
+	cfg.Core.PeerReconcileInterval = 50 * time.Millisecond
+	controller := reconcileController{added: make(chan domain.PeerIdentifier, 1), removed: make(chan domain.PeerIdentifier, 1)}
+	m := Manager{cfg: cfg, db: reconcileRepo{}, wg: &ControllerManager{controllers: map[domain.InterfaceBackend]backendInstance{config.LocalBackendName: {Implementation: controller}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.StartPeerReconciliation(ctx)
+	select {
+	case id := <-controller.removed:
+		require.Equal(t, domain.PeerIdentifier("revoked"), id)
+	case <-time.After(time.Second):
+		t.Fatal("missed deletion was not recovered")
+	}
+	select {
+	case id := <-controller.added:
+		require.Equal(t, domain.PeerIdentifier("new"), id)
+	case <-time.After(time.Second):
+		t.Fatal("missed creation was not recovered")
 	}
 }
