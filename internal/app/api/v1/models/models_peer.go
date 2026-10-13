@@ -40,8 +40,8 @@ type Peer struct {
 	// PersistentKeepalive is the optional persistent keep-alive interval in seconds.
 	PersistentKeepalive ConfigOption[int] `json:"PersistentKeepalive"`
 
-	// PrivateKey is the private Key of the peer.
-	PrivateKey string `json:"PrivateKey" example:"yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=" binding:"required,len=44"`
+	// PrivateKey is optional: imported peers keep their private key on the client.
+	PrivateKey string `json:"PrivateKey" example:"yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=" binding:"omitempty,len=44"`
 	// PublicKey is the public Key of the server peer.
 	PublicKey string `json:"PublicKey" example:"TrMvSoP4jYQlY6RIzBgbssQqY3vxI2Pi+y71lOWWXX0=" binding:"omitempty,len=44"`
 
