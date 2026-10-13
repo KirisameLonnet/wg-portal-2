@@ -144,7 +144,10 @@ func main() {
 			if err := wireGuardManager.RestoreInterfaceState(syncCtx, true /*updateDbOnError*/); err != nil {
 				slog.Error("initial interface restore failed", "err", err)
 			}
+			wireGuardManager.StartPeerReconciliation(ctx)
 		}()
+	} else {
+		wireGuardManager.StartPeerReconciliation(ctx)
 	}
 
 	validatorManager := validator.New()

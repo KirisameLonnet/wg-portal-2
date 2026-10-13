@@ -45,6 +45,8 @@ type Config struct {
 		RestoreState                bool `yaml:"restore_state"`
 		SyncOnStartup               bool `mapstructure:"sync_on_startup" yaml:"sync_on_startup" env:"WG_SYNC_ON_STARTUP"`
 
+		PeerReconcileInterval time.Duration `yaml:"peer_reconcile_interval"`
+
 		ManageDns              bool `yaml:"manage_dns"` // Controls if wg-portal should manage DNS via resolvconf
 		IgnoreMainDefaultRoute bool `yaml:"ignore_main_default_route"`
 
@@ -161,6 +163,7 @@ func defaultConfig() *Config {
 	cfg.Core.AdminApiToken = "" // by default, the API access is disabled
 	cfg.Core.ImportExisting = true
 	cfg.Core.RestoreState = true
+	cfg.Core.PeerReconcileInterval = 30 * time.Second
 	cfg.Core.CreateDefaultPeer = false
 	cfg.Core.CreateDefaultPeerOnCreation = false
 	cfg.Core.EditableKeys = true
