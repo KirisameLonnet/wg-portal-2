@@ -1,0 +1,18 @@
+[Unit]
+Description=WireGuard Portal distributed access
+Wants=network-online.target
+After=network-online.target mariadb.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/wg-portal
+Environment=WG_PORTAL_CONFIG=/etc/wg-portal/config.json
+ExecStart=/usr/local/bin/wg-portal-2
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

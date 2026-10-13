@@ -6,6 +6,7 @@ on:
 
 jobs:
   release:
+    if: github.repository == 'fedor-git/wg-portal-2'
     runs-on: ubuntu-latest
     permissions:
       contents: write

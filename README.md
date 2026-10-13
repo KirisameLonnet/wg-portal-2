@@ -1,3 +1,5 @@
+> Maintained fork: [KirisameLonnet/wg-portal-2](https://github.com/KirisameLonnet/wg-portal-2). Adds automatic recovery of missed peer events and existing public-key-only peer support. See [distributed access](docs/distributed-access.md).
+
 # wg-portal-2
 
 [![Build Status](https://github.com/fedor-git/wg-portal-2/actions/workflows/docker-publish.yml/badge.svg?event=push)](https://github.com/fedor-git/wg-portal-2/actions/workflows/docker-publish.yml)
@@ -70,6 +72,7 @@ The latest version introduces several new core configuration options for product
 | `delete_expired_peers` | boolean | `false` | Automatically remove peers after their TTL expires. |
 | `default_user_ttl` | string/integer | `0` | Default Time-To-Live for peers (e.g., `30d`, `1` for 1 day). `0` means no expiration. |
 | `sync_on_startup` | boolean | `false` | Synchronize interface state with database on startup |
+| `peer_reconcile_interval` | duration | `30s` | Repair missed fanout events from the shared DB locally; `0` disables. Enabled only with fanout. |
 | `force_client_ip_as_allowed_ip` | boolean | `false` | Use client IP as allowed IP instead of calculating from pool |
 | `master` | boolean | `false` | Mark this instance as master (for failover scenarios) |
 
