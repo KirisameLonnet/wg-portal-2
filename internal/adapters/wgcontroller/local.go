@@ -507,13 +507,20 @@ func (c LocalController) updatePeer(deviceId domain.InterfaceIdentifier, pp *dom
 		slog.Debug("[updatePeer] allowedIPs to ConfigureDevice", "index", i, "ipnet", ip.String())
 	}
 	
+	// Nil leaves existing settings unchanged in wgctrl. Explicit zeros are
+	// required when an administrator removes a PSK or disables keepalive.
+	presharedKey := pp.GetPresharedKey()
+	if pp.PresharedKey == "" {
+		presharedKey = &wgtypes.Key{}
+	}
+	keepalive := time.Duration(pp.PersistentKeepalive) * time.Second
 	cfg := wgtypes.PeerConfig{
 		PublicKey:                   pp.GetPublicKey(),
 		Remove:                      false,
 		UpdateOnly:                  true,
-		PresharedKey:                pp.GetPresharedKey(),
+		PresharedKey:                presharedKey,
 		Endpoint:                    pp.GetEndpointAddress(),
-		PersistentKeepaliveInterval: pp.GetPersistentKeepaliveTime(),
+		PersistentKeepaliveInterval: &keepalive,
 		ReplaceAllowedIPs:           true,
 		AllowedIPs:                  allowedIPs,
 	}
