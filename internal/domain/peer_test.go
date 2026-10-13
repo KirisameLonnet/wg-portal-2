@@ -89,6 +89,10 @@ func TestPeer_GenerateDisplayName(t *testing.T) {
 	assert.Equal(t, expected, peer.DisplayName)
 
 	peer.GenerateDisplayName("")
+	assert.Equal(t, expected, peer.DisplayName) // Existing names are preserved.
+
+	peer = &Peer{Identifier: "12345678"}
+	peer.GenerateDisplayName("")
 	expected = "Peer 12345678"
 	assert.Equal(t, expected, peer.DisplayName)
 }
