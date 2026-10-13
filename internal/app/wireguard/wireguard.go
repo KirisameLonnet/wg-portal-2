@@ -70,6 +70,7 @@ type Manager struct {
 	quick           WgQuickController
 	statsCollector  *StatisticsCollector
 	userLockMap     *sync.Map
+	peerSyncMu      *sync.Mutex
 	startupComplete chan struct{} // Signals when startup peer loading complete
 }
 
@@ -90,6 +91,7 @@ func NewWireGuardManager(
 		statsCollector:  statsCollector,
 		userLockMap:     &sync.Map{},
 		startupComplete: make(chan struct{}),
+		peerSyncMu:      &sync.Mutex{},
 	}
 
 	m.connectToMessageBus()
@@ -200,9 +202,9 @@ func (m Manager) connectToMessageBus() {
 	_ = m.bus.Subscribe(app.TopicPeerStateChanged, m.handlePeerStateChangeEvent)
 
 	// Event-driven peer synchronization across nodes
-	_ = m.bus.Subscribe(app.TopicPeerCreatedSync, m.handlePeerCreatedSyncEvent)
-	_ = m.bus.Subscribe(app.TopicPeerUpdatedSync, m.handlePeerUpdatedSyncEvent)
-	_ = m.bus.Subscribe(app.TopicPeerDeletedSync, m.handlePeerDeletedSyncEvent)
+	_ = m.bus.Subscribe(app.TopicPeerCreatedSync, m.handlePeerSyncedLocalEvent)
+	_ = m.bus.Subscribe(app.TopicPeerUpdatedSync, m.handlePeerSyncedLocalEvent)
+	_ = m.bus.Subscribe(app.TopicPeerDeletedSync, m.handlePeerSyncedLocalEvent)
 
 	// Local peer sync events from HTTP endpoint (breaks fanout feedback loop)
 	_ = m.bus.Subscribe(app.TopicPeerSyncedLocal, m.handlePeerSyncedLocalEvent)
@@ -635,101 +637,16 @@ func (m Manager) initializePeerTTL(ctx context.Context) {
 }
 
 func (m Manager) handlePeerInterfaceUpdatedEvent(interfaceId domain.InterfaceIdentifier) {
-	// Prevent panic from crashing the entire node in multi-node cluster
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("Panic recovered in handlePeerInterfaceUpdatedEvent",
-				"interface", interfaceId,
-				"panic", r,
-				"stack", "see logs above")
-		}
-	}()
-
+	m.peerSyncMu.Lock()
+	defer m.peerSyncMu.Unlock()
 	ctx := context.Background()
-
-	slog.Debug("handling peer interface updated event for WireGuard sync", "interface", interfaceId)
-
-	// Get current peers from database
-	dbPeers, err := m.db.GetInterfacePeers(ctx, interfaceId)
+	iface, peers, err := m.db.GetInterfaceAndPeers(ctx, interfaceId)
+	if err == nil {
+		_, err = m.syncInterfacePeers(ctx, *iface, peers)
+	}
 	if err != nil {
-		slog.Error("failed to get interface peers from DB", "interface", interfaceId, "error", err)
-		return
+		slog.Error("failed to sync interface peers", "interface", interfaceId, "error", err)
 	}
-
-	slog.Debug("WireGuard sync found peers in DB", "interface", interfaceId, "count", len(dbPeers))
-	for _, peer := range dbPeers {
-		slog.Debug("DB peer", "interface", interfaceId, "peer", peer.Identifier, "disabled", peer.IsDisabled())
-	}
-
-	// Get local controller
-	localController := m.wg.GetControllerByName(config.LocalBackendName)
-	if localController == nil {
-		slog.Error("local interface controller not found")
-		return
-	}
-
-	// Get current peers from WireGuard device
-	wgPeers, err := localController.GetPeers(ctx, interfaceId)
-	if err != nil {
-		slog.Error("failed to get peers from WireGuard device", "interface", interfaceId, "error", err)
-		return
-	}
-
-	slog.Debug("WireGuard sync found peers in WG device", "interface", interfaceId, "count", len(wgPeers))
-	for _, peer := range wgPeers {
-		slog.Debug("WG peer", "interface", interfaceId, "peer", peer.Identifier)
-	}
-
-	// Create maps for easier comparison
-	dbPeerMap := make(map[domain.PeerIdentifier]domain.Peer)
-	for _, peer := range dbPeers {
-		dbPeerMap[peer.Identifier] = peer
-	}
-
-	wgPeerMap := make(map[domain.PeerIdentifier]domain.PhysicalPeer)
-	for _, peer := range wgPeers {
-		wgPeerMap[peer.Identifier] = peer
-	}
-
-	// Remove peers that exist in WireGuard but not in DB
-	for wgPeerID := range wgPeerMap {
-		if _, exists := dbPeerMap[wgPeerID]; !exists {
-			slog.Debug("removing peer from WireGuard device", "interface", interfaceId, "peer", wgPeerID)
-			err := localController.DeletePeer(ctx, interfaceId, wgPeerID)
-			if err != nil {
-				slog.Error("failed to remove peer from WireGuard device", "interface", interfaceId, "peer", wgPeerID, "error", err)
-			}
-		}
-	}
-
-	// Add or update peers that exist in DB but not in WireGuard or are different
-	for _, dbPeer := range dbPeers {
-		if dbPeer.IsDisabled() {
-			// If peer is disabled in DB, make sure it's removed from WireGuard
-			if _, exists := wgPeerMap[dbPeer.Identifier]; exists {
-				slog.Debug("removing disabled peer from WireGuard device", "interface", interfaceId, "peer", dbPeer.Identifier)
-				err := localController.DeletePeer(ctx, interfaceId, dbPeer.Identifier)
-				if err != nil {
-					slog.Error("failed to remove disabled peer from WireGuard device", "interface", interfaceId, "peer", dbPeer.Identifier, "error", err)
-				}
-			}
-			continue
-		}
-
-		// Peer is enabled, make sure it exists in WireGuard with correct configuration
-		slog.Debug("syncing peer in WireGuard device", "interface", interfaceId, "peer", dbPeer.Identifier)
-		err := localController.SavePeer(ctx, interfaceId, dbPeer.Identifier, func(pp *domain.PhysicalPeer) (*domain.PhysicalPeer, error) {
-			// Use MergeToPhysicalPeer to properly convert domain.Peer to PhysicalPeer
-			// This respects the ForceClientIPAsAllowedIP config setting
-			domain.MergeToPhysicalPeer(pp, &dbPeer, m.cfg.Core.ForceClientIPAsAllowedIP)
-			return pp, nil
-		})
-		if err != nil {
-			slog.Error("failed to sync peer in WireGuard device", "interface", interfaceId, "peer", dbPeer.Identifier, "error", err)
-		}
-	}
-
-	slog.Debug("completed WireGuard interface sync", "interface", interfaceId)
 }
 
 // handlePeersExpiredRemovedEvent обробляє событие про видалені протухлі peer'
@@ -788,261 +705,9 @@ func (m Manager) handlePeersExpiredRemovedEvent(expiredPeerIDs []string) {
 		"failed_from_wg", failedFromWg)
 }
 
-// handlePeerCreatedSyncEvent syncs a newly created peer to local WireGuard
-// Called on all nodes when peer:created:sync event is published (contains only peerID)
-func (m Manager) handlePeerCreatedSyncEvent(peerID domain.PeerIdentifier) {
-	ctx := context.Background()
-	startProcessTime := time.Now()
-	slog.Info("[PEER_SYNC] handling created peer - START",
-		"peer_id", peerID,
-		"processing_start_unix_ns", startProcessTime.UnixNano())
-
-	// Get peer from database
-	dbStartTime := time.Now()
-	peer, err := m.db.GetPeer(ctx, peerID)
-	dbDuration := time.Since(dbStartTime)
-	if err != nil {
-		slog.Error("[PEER_SYNC] failed to get peer from database", "peer_id", peerID, "error", err)
-		return
-	}
-	slog.Info("[PEER_SYNC] GetPeer completed",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"db_query_ms", dbDuration.Milliseconds())
-
-	// Get the WireGuard controller for the interface
-	localController := m.wg.GetControllerByName(config.LocalBackendName)
-	if localController == nil {
-		slog.Warn("[PEER_SYNC] local WireGuard controller not available")
-		return
-	}
-
-	// Add peer to WireGuard using SavePeer
-	// SavePeer handles duplicate peers internally by using UpdateOnly flag
-	// Removed GetPeers() check as it was causing excessive CPU usage on large clusters
-	savePeerStartTime := time.Now()
-	if err := localController.SavePeer(ctx, peer.InterfaceIdentifier, peer.Identifier, func(pp *domain.PhysicalPeer) (*domain.PhysicalPeer, error) {
-		domain.MergeToPhysicalPeer(pp, peer, m.cfg.Core.ForceClientIPAsAllowedIP)
-		return pp, nil
-	}); err != nil {
-		slog.Error("[PEER_SYNC] failed to add peer to WireGuard", "peer_id", peerID, "error", err)
-		return
-	}
-	savePeerDuration := time.Since(savePeerStartTime)
-	slog.Info("[PEER_SYNC] SavePeer completed",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"save_peer_ms", savePeerDuration.Milliseconds())
-
-	totalDuration := time.Since(startProcessTime)
-	slog.Info("[PEER_SYNC] successfully added peer to WireGuard - COMPLETED",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"total_processing_ms", totalDuration.Milliseconds(),
-		"total_processing_us", totalDuration.Microseconds(),
-		"breakdown_ms", map[string]interface{}{
-			"db_query":  dbDuration.Milliseconds(),
-			"save_peer": savePeerDuration.Milliseconds(),
-		})
-}
-
-// handlePeerUpdatedSyncEvent syncs an updated peer to local WireGuard
-// Called on all nodes when peer:updated:sync event is published (contains only peerID)
-func (m Manager) handlePeerUpdatedSyncEvent(peerID domain.PeerIdentifier) {
-	ctx := context.Background()
-	startProcessTime := time.Now()
-	slog.Info("[PEER_SYNC] handling updated peer - START",
-		"peer_id", peerID,
-		"processing_start_unix_ns", startProcessTime.UnixNano())
-
-	// Get peer from database
-	dbStartTime := time.Now()
-	peer, err := m.db.GetPeer(ctx, peerID)
-	dbDuration := time.Since(dbStartTime)
-	if err != nil {
-		slog.Error("[PEER_SYNC] failed to get peer from database", "peer_id", peerID, "error", err)
-		return
-	}
-	slog.Info("[PEER_SYNC] GetPeer completed",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"db_query_ms", dbDuration.Milliseconds())
-
-	// Get the WireGuard controller for the interface
-	localController := m.wg.GetControllerByName(config.LocalBackendName)
-	if localController == nil {
-		slog.Warn("[PEER_SYNC] local WireGuard controller not available")
-		return
-	}
-
-	// Update peer in WireGuard using SavePeer
-	savePeerStartTime := time.Now()
-	if err := localController.SavePeer(ctx, peer.InterfaceIdentifier, peer.Identifier, func(pp *domain.PhysicalPeer) (*domain.PhysicalPeer, error) {
-		domain.MergeToPhysicalPeer(pp, peer, m.cfg.Core.ForceClientIPAsAllowedIP)
-		return pp, nil
-	}); err != nil {
-		slog.Error("[PEER_SYNC] failed to update peer in WireGuard", "peer_id", peerID, "error", err)
-		return
-	}
-	savePeerDuration := time.Since(savePeerStartTime)
-	slog.Info("[PEER_SYNC] SavePeer completed",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"save_peer_ms", savePeerDuration.Milliseconds())
-
-	totalDuration := time.Since(startProcessTime)
-	slog.Info("[PEER_SYNC] successfully updated peer in WireGuard - COMPLETED",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"total_processing_ms", totalDuration.Milliseconds(),
-		"total_processing_us", totalDuration.Microseconds(),
-		"breakdown_ms", map[string]interface{}{
-			"db_query":  dbDuration.Milliseconds(),
-			"save_peer": savePeerDuration.Milliseconds(),
-		})
-}
-
-// handlePeerDeletedSyncEvent removes a deleted peer from local WireGuard
-// Called on all nodes when peer:deleted:sync event is published (contains only peerID)
-func (m Manager) handlePeerDeletedSyncEvent(peerID domain.PeerIdentifier) {
-	ctx := context.Background()
-	startProcessTime := time.Now()
-	slog.Info("[PEER_SYNC] handling deleted peer - START",
-		"peer_id", peerID,
-		"processing_start_unix_ns", startProcessTime.UnixNano())
-
-	// Get all interfaces to check peer in all of them
-	dbStartTime := time.Now()
-	interfaces, err := m.db.GetAllInterfaces(ctx)
-	dbDuration := time.Since(dbStartTime)
-	if err != nil {
-		slog.Error("[PEER_SYNC] failed to get interfaces",
-			"db_query_duration_ms", dbDuration.Milliseconds(),
-			"error", err)
-		return
-	}
-
-	slog.Info("[PEER_SYNC] interfaces fetched from database",
-		"interfaces_count", len(interfaces),
-		"db_query_duration_ms", dbDuration.Milliseconds())
-
-	// Get the WireGuard controller
-	localController := m.wg.GetControllerByName(config.LocalBackendName)
-	if localController == nil {
-		slog.Warn("[PEER_SYNC] local WireGuard controller not available")
-		return
-	}
-
-	// Remove peer from WireGuard on all interfaces
-	totalDeleteDuration := time.Duration(0)
-	for _, iface := range interfaces {
-		deleteStartTime := time.Now()
-		if err := localController.DeletePeer(ctx, iface.Identifier, peerID); err != nil {
-			slog.Debug("[PEER_SYNC] peer not in WireGuard or already deleted",
-				"interface", iface.Identifier, "peer_id", peerID)
-		} else {
-			deleteDuration := time.Since(deleteStartTime)
-			totalDeleteDuration += deleteDuration
-			slog.Info("[PEER_SYNC] successfully removed peer from WireGuard",
-				"interface", iface.Identifier, "peer_id", peerID,
-				"delete_duration_ms", deleteDuration.Milliseconds())
-		}
-	}
-
-	// CRITICAL: Remove Prometheus metrics for the deleted peer
-	// This prevents metrics from persisting after peer deletion
-	if m.statsCollector != nil && m.statsCollector.ms != nil {
-		m.statsCollector.ms.RemovePeerMetricsByID(string(peerID))
-	}
-
-	totalDuration := time.Since(startProcessTime)
-	slog.Info("[PEER_SYNC] deleted peer from all interfaces - COMPLETED",
-		"peer_id", peerID,
-		"interfaces_checked", len(interfaces),
-		"total_processing_ms", totalDuration.Milliseconds(),
-		"total_processing_us", totalDuration.Microseconds(),
-		"breakdown_ms", map[string]interface{}{
-			"db_query":          dbDuration.Milliseconds(),
-			"delete_operations": totalDeleteDuration.Milliseconds(),
-		})
-}
-
-// handlePeerSyncedLocalEvent syncs a peer received from HTTP fanout to local WireGuard
-// Published by HTTP endpoint to break fanout feedback loop
-// Only called locally (fanout does NOT subscribe to this event)
+// Peer events are hints to read the current DB state, not commands to replay.
 func (m Manager) handlePeerSyncedLocalEvent(peerID domain.PeerIdentifier) {
-	ctx := context.Background()
-	startProcessTime := time.Now()
-	slog.Info("[PEER_SYNC_LOCAL] handling synced peer - START",
-		"peer_id", peerID,
-		"processing_start_unix_ns", startProcessTime.UnixNano())
-
-	// Get peer from database
-	dbStartTime := time.Now()
-	peer, err := m.db.GetPeer(ctx, peerID)
-	dbDuration := time.Since(dbStartTime)
-	if err != nil {
-		// Peer not found could mean:
-		// 1. Deletion event (peer was synced as deleted)
-		// 2. Database replication lag
-		// Either way, try to delete from WireGuard
-		slog.Warn("[PEER_SYNC_LOCAL] peer not found in database (may be deleted)", "peer_id", peerID, "db_query_ms", dbDuration.Milliseconds())
-
-		// Get interfaces and delete peer from all of them
-		interfaces, err := m.db.GetAllInterfaces(ctx)
-		if err == nil {
-			localController := m.wg.GetControllerByName(config.LocalBackendName)
-			if localController != nil {
-				for _, iface := range interfaces {
-					_ = localController.DeletePeer(ctx, iface.Identifier, peerID)
-				}
-			}
-		}
-
-		// CRITICAL: Remove Prometheus metrics for the deleted peer
-		// This prevents metrics from persisting after peer deletion
-		if m.statsCollector != nil && m.statsCollector.ms != nil {
-			m.statsCollector.ms.RemovePeerMetricsByID(string(peerID))
-		}
-
-		slog.Info("[PEER_SYNC_LOCAL] completed deletion cleanup - COMPLETED", "peer_id", peerID)
-		return
+	if err := m.SyncPeer(context.Background(), peerID); err != nil {
+		slog.Error("failed to sync peer", "peer_id", peerID, "error", err)
 	}
-	slog.Info("[PEER_SYNC_LOCAL] GetPeer completed",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"db_query_ms", dbDuration.Milliseconds())
-
-	// Get the WireGuard controller for the interface
-	localController := m.wg.GetControllerByName(config.LocalBackendName)
-	if localController == nil {
-		slog.Warn("[PEER_SYNC_LOCAL] local WireGuard controller not available")
-		return
-	}
-
-	// Add peer to WireGuard using SavePeer
-	savePeerStartTime := time.Now()
-	if err := localController.SavePeer(ctx, peer.InterfaceIdentifier, peer.Identifier, func(pp *domain.PhysicalPeer) (*domain.PhysicalPeer, error) {
-		domain.MergeToPhysicalPeer(pp, peer, m.cfg.Core.ForceClientIPAsAllowedIP)
-		return pp, nil
-	}); err != nil {
-		slog.Error("[PEER_SYNC_LOCAL] failed to add peer to WireGuard", "peer_id", peerID, "error", err)
-		return
-	}
-	savePeerDuration := time.Since(savePeerStartTime)
-	slog.Info("[PEER_SYNC_LOCAL] SavePeer completed",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"save_peer_ms", savePeerDuration.Milliseconds())
-
-	totalDuration := time.Since(startProcessTime)
-	slog.Info("[PEER_SYNC_LOCAL] successfully synced peer to WireGuard - COMPLETED",
-		"peer_id", peerID,
-		"interface", peer.InterfaceIdentifier,
-		"total_processing_ms", totalDuration.Milliseconds(),
-		"total_processing_us", totalDuration.Microseconds(),
-		"breakdown_ms", map[string]interface{}{
-			"db_query":  dbDuration.Milliseconds(),
-			"save_peer": savePeerDuration.Milliseconds(),
-		})
 }

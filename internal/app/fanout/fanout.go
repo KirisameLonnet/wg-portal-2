@@ -176,8 +176,7 @@ func Start(ctx context.Context, bus EventBus, fc cfgpkg.FanoutConfig, wireGuardM
 		client:        createHTTPClient(s),
 		debounce:      newDebouncer(s.Debounce),
 		metricsServer: metricsServer,
-		wgm:           wireGuardManager,
-		failedHosts:   make(map[string]*hostRetryState),
+		pending:       make(map[string]chan struct{}),
 	}
 	if bus != nil {
 		for _, topic := range s.Topics {
@@ -190,7 +189,7 @@ func Start(ctx context.Context, bus EventBus, fc cfgpkg.FanoutConfig, wireGuardM
 					if isPeerEvent {
 						// Immediate fire for peer events (no debounce delay)
 						slog.Debug("[FANOUT] immediate fire for peer event", "topic", t, "arg", arg)
-						go f.fireForPeerEvent(context.Background(), t, arg)
+						f.fireForPeerEvent(ctx, t, arg)
 					} else {
 						// Debounced fire for interface events
 						// BUT: Block fanout bumps during startup to prevent cascade when peers not yet loaded
@@ -276,19 +275,13 @@ func createHTTPClient(s settings) *http.Client {
 	}
 }
 
-type hostRetryState struct {
-	lastFailureTime time.Time
-	retryCount      int
-}
-
 type fanout struct {
-	cfg             settings
-	client          *http.Client
-	debounce        *debouncer
-	metricsServer   MetricsServerHealthUpdater
-	wgm             *wireguard.Manager
-	failedHosts     map[string]*hostRetryState
-	failedHostsMu   sync.RWMutex
+	cfg           settings
+	client        *http.Client
+	debounce      *debouncer
+	metricsServer MetricsServerHealthUpdater
+	pending       map[string]chan struct{}
+	pendingMu     sync.Mutex
 }
 
 func (f *fanout) loop(ctx context.Context) {
@@ -307,176 +300,77 @@ func (f *fanout) bump(reason string) {
 	f.debounce.Bump()
 }
 
-// hostCanRetry checks if a host should be retried based on exponential backoff
-// Retry delays: 1s, 2s, 4s for attempts 1, 2, 3 respectively
-func (f *fanout) hostCanRetry(hostURL string, retryCount int) bool {
-	f.failedHostsMu.RLock()
-	state, exists := f.failedHosts[hostURL]
-	f.failedHostsMu.RUnlock()
-
-	if !exists {
-		return true // Host not in failed cache, can retry
-	}
-
-	// Max 3 retry attempts
-	if retryCount >= 3 {
-		return false
-	}
-
-	// Exponential backoff: 1s * 2^(retryCount-1)
-	// Attempt 0: 1s, Attempt 1: 2s, Attempt 2: 4s
-	backoffDuration := time.Duration(1<<uint(retryCount)) * time.Second
-	canRetry := time.Since(state.lastFailureTime) >= backoffDuration
-
-	if canRetry {
-		slog.Debug("[FANOUT_PEER] host backoff expired, can retry",
-			"url", hostURL, "retry_count", state.retryCount, "backoff_duration", backoffDuration)
-	}
-
-	return canRetry
-}
-
-// markHostFailed records a host failure with timestamp and retry count
-func (f *fanout) markHostFailed(hostURL string) {
-	f.failedHostsMu.Lock()
-	defer f.failedHostsMu.Unlock()
-
-	if state, exists := f.failedHosts[hostURL]; exists {
-		state.lastFailureTime = time.Now()
-		state.retryCount++
-	} else {
-		f.failedHosts[hostURL] = &hostRetryState{
-			lastFailureTime: time.Now(),
-			retryCount:      1,
-		}
-	}
-}
-
-// clearHostFailed removes a host from failed cache on successful sync
-func (f *fanout) clearHostFailed(hostURL string) {
-	f.failedHostsMu.Lock()
-	delete(f.failedHosts, hostURL)
-	f.failedHostsMu.Unlock()
-}
-
-// fireForPeerEvent sends peer sync events to all nodes immediately (no debounce)
-// This ensures new/updated/deleted peers propagate instantly across cluster
-// For deletion events, skips HTTP sync since event handler handles deletion directly
-// Implements retry logic with exponential backoff for transient failures (DNS, network)
-func (f *fanout) fireForPeerEvent(ctx context.Context, topic string, peerID any) {
-	// CRITICAL: Block peer sync during startup to prevent 502 cascade
-	// Each peer-specific sync request requires local WireGuard to have peers loaded
-	// If not started yet, skip to prevent database lookups on uninitialized state
-	if !f.wgm.IsStartupComplete() {
-		peerIDStr := fmt.Sprintf("%v", peerID)
-		slog.Info("[FANOUT_PEER] skip peer sync during startup",
-			"topic", topic, "peer_id", peerIDStr)
-		return
-	}
-
-	peerIDStr := fmt.Sprintf("%v", peerID)
-
-	var wg sync.WaitGroup
-	var failedPeers []string
-	var failedMutex sync.Mutex
-
-	slog.Info("[FANOUT_PEER] sending immediate peer sync event to all nodes",
-		"topic", topic, "peer_id", peerIDStr)
-
+// A notification invalidates one peer; the receiver reads its latest DB state.
+// One worker per destination/peer coalesces notifications and retries until ACK.
+func (f *fanout) fireForPeerEvent(ctx context.Context, _ string, peerID any) {
 	for _, base := range f.cfg.Peers {
 		base = strings.TrimSpace(base)
-		if base == "" {
+		if base == "" || isSelf(base, f.cfg.SelfURL) {
 			continue
 		}
-		if isSelf(base, f.cfg.SelfURL) {
-			continue
+		endpoint := strings.TrimRight(base, "/") + "/api/v1/peer/sync?peer_id=" + url.QueryEscape(fmt.Sprint(peerID))
+		f.pendingMu.Lock()
+		if changed, exists := f.pending[endpoint]; exists {
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+		} else {
+			changed := make(chan struct{}, 1)
+			f.pending[endpoint] = changed
+			go f.deliverPeer(ctx, endpoint, changed)
 		}
+		f.pendingMu.Unlock()
+	}
+}
 
-		// Extract event type from topic: "peer:created:sync" → "created"
-		eventType := "created"
-		if topic == "peer:updated:sync" {
-			eventType = "updated"
-		} else if topic == "peer:deleted:sync" {
-			eventType = "deleted"
-		}
-
-		endpoint := strings.TrimRight(base, "/") + "/api/v1/peer/sync?peer_id=" + url.QueryEscape(peerIDStr) + "&event=" + eventType
-
-		wg.Add(1)
-		go func(u string) {
-			defer wg.Done()
-			
-			// Skip hosts that are in backoff period
-			f.failedHostsMu.RLock()
-			state, inFailedCache := f.failedHosts[u]
-			sentryRetryCount := 0
-			if inFailedCache {
-				sentryRetryCount = state.retryCount
-			}
-			f.failedHostsMu.RUnlock()
-			
-			if !f.hostCanRetry(u, sentryRetryCount) {
-				slog.Debug("[FANOUT_PEER] host in backoff period, skipping",
-					"url", u, "peer_id", peerIDStr, "retry_count", sentryRetryCount)
-				failedMutex.Lock()
-				failedPeers = append(failedPeers, u+" (backoff)")
-				failedMutex.Unlock()
-				return
-			}
-
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
-			if err != nil {
-				slog.Warn("[FANOUT_PEER] build request failed", "url", u, "err", err)
-				f.markHostFailed(u)
-				failedMutex.Lock()
-				failedPeers = append(failedPeers, u)
-				failedMutex.Unlock()
-				return
-			}
-
-			if f.cfg.AuthHeader != "" && f.cfg.AuthValue != "" {
+func (f *fanout) deliverPeer(ctx context.Context, endpoint string, changed chan struct{}) {
+	delay := time.Second
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+		if err == nil {
+			if f.cfg.AuthHeader != "" {
 				req.Header.Set(f.cfg.AuthHeader, f.cfg.AuthValue)
 			}
-
 			req.Header.Set(hdrOrigin, f.cfg.Origin)
 			req.Header.Set(hdrNoEcho, "1")
 			req.Header.Set(hdrCorrID, uuid.NewString())
-
-			resp, err := f.client.Do(req)
-			if err != nil {
-				slog.Warn("[FANOUT_PEER] sync failed", "url", u, "peer_id", peerIDStr, "err", err)
-				f.markHostFailed(u)
-				failedMutex.Lock()
-				failedPeers = append(failedPeers, u)
-				failedMutex.Unlock()
+			var resp *http.Response
+			resp, err = f.client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode >= 300 {
+					err = fmt.Errorf("sync returned %s", resp.Status)
+				}
+			}
+		}
+		if err == nil {
+			f.metricsServer.SetSyncStatus(true, "")
+			f.pendingMu.Lock()
+			select {
+			case <-changed:
+				f.pendingMu.Unlock()
+				delay = time.Second
+				continue
+			default:
+				delete(f.pending, endpoint)
+				f.pendingMu.Unlock()
 				return
 			}
-			_ = resp.Body.Close()
-
-			if resp.StatusCode >= 300 {
-				slog.Warn("[FANOUT_PEER] sync non-2xx", "url", u, "peer_id", peerIDStr, "status", resp.Status)
-				f.markHostFailed(u)
-				failedMutex.Lock()
-				failedPeers = append(failedPeers, u+" ("+resp.Status+")")
-				failedMutex.Unlock()
-				return
-			}
-			
-			// Success: clear from failed cache
-			f.clearHostFailed(u)
-			slog.Debug("[FANOUT_PEER] sync ok", "url", u, "peer_id", peerIDStr)
-		}(endpoint)
-	}
-
-	wg.Wait()
-
-	if len(failedPeers) > 0 {
-		errMsg := fmt.Sprintf("Peer sync failed for peers: %s", strings.Join(failedPeers, ", "))
-		slog.Warn("[FANOUT_PEER] some peers failed", "failed_count", len(failedPeers), "message", errMsg)
-		f.metricsServer.SetSyncStatus(false, errMsg)
-	} else {
-		slog.Info("[FANOUT_PEER] all peers synced successfully", "peer_id", peerIDStr)
-		f.metricsServer.SetSyncStatus(true, "")
+		}
+		slog.Warn("[FANOUT_PEER] retrying unacknowledged sync", "url", endpoint, "error", err, "delay", delay)
+		f.metricsServer.SetSyncStatus(false, err.Error())
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			f.pendingMu.Lock()
+			delete(f.pending, endpoint)
+			f.pendingMu.Unlock()
+			return
+		case <-timer.C:
+			delay = min(delay*2, 30*time.Second)
+		}
 	}
 }
 

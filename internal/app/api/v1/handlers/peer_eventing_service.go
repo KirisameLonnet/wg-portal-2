@@ -34,6 +34,10 @@ func (s *eventingPeerService) GetAllInterfaces(ctx context.Context) ([]domain.In
 func (s *eventingPeerService) Prepare(ctx context.Context, id domain.InterfaceIdentifier) (*domain.Peer, error) {
 	return s.inner.Prepare(ctx, id)
 }
+func (s *eventingPeerService) SyncPeer(ctx context.Context, id domain.PeerIdentifier) error {
+	return s.inner.SyncPeer(ctx, id)
+}
+
 func (s *eventingPeerService) SyncAllPeersFromDB(ctx context.Context) (int, error) {
 	return s.inner.SyncAllPeersFromDB(ctx)
 }

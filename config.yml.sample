@@ -13,7 +13,7 @@ core:
   delete_expired_peers: true  # true = delete, false = disable expired peers
   force_client_ip_as_allowed_ip: true  # Always use client's IP as AllowedIPs on server (prevents overlapping 0.0.0.0/0)
   master: false  # Set to true on ONE node only - that node will handle expired peer deletion (master-only cleanup for cluster safety)
-  peer_reconcile_interval: 30s  # Repair missed events locally from DB; 0 disables. Requires fanout.enabled.
+  peer_reconcile_interval: 30s  # Compare DB/kernel config; write only differences. 0 disables comparison, not fanout retries.
   fanout:
     enabled: false  # Set to true to enable FANOUT synchronization
     peers:  # List of other wg-portal-2 instances to sync with (use internal Docker network URLs)

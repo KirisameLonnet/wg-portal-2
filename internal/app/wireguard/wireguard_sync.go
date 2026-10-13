@@ -20,87 +20,25 @@ func (m Manager) SyncAllPeersFromDB(ctx context.Context) (int, error) {
 	if err := domain.ValidateAdminAccessRights(ctx); err != nil {
 		return 0, err
 	}
-	if m.db == nil {
-		return 0, fmt.Errorf("db repo is nil")
-	}
-	if m.wg == nil {
-		return 0, fmt.Errorf("wg controller is nil")
-	}
-
-	// Clean orphaned statuses BEFORE syncing WireGuard
-	// This allows us to detect peers in WireGuard that shouldn't be there
-	if m.statsCollector != nil {
-		slog.Info("SyncAllPeersFromDB: calling CleanOrphanedStatuses BEFORE sync")
-		m.statsCollector.CleanOrphanedStatuses(ctx)
-	} else {
-		slog.Warn("SyncAllPeersFromDB: statsCollector is nil, skipping orphaned cleanup")
-	}
-
-	ifaces, err := m.db.GetAllInterfaces(ctx)
+	m.peerSyncMu.Lock()
+	defer m.peerSyncMu.Unlock()
+	interfaces, err := m.db.GetAllInterfaces(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("list interfaces: %w", err)
+		return 0, err
 	}
-
-	totalLoaded := 0
-	applied := 0
-	for _, in := range ifaces {
-		peers, err := m.db.GetInterfacePeers(ctx, in.Identifier)
+	loaded := 0
+	for _, iface := range interfaces {
+		peers, err := m.db.GetInterfacePeers(ctx, iface.Identifier)
 		if err != nil {
-			slog.ErrorContext(ctx, "peer sync: failed to load peers", "iface", in.Identifier, "err", err)
-			continue
+			return loaded, err
 		}
-
-		existingPeers, err := m.wg.ListPeers(ctx, string(in.Identifier))
+		count, err := m.syncInterfacePeers(ctx, iface, peers)
 		if err != nil {
-			slog.ErrorContext(ctx, "failed to list existing peers", "iface", in.Identifier, "err", err)
-			continue
+			return loaded, err
 		}
-
-		existingPeerMap := make(map[string]domain.Peer)
-		for _, p := range existingPeers {
-			existingPeerMap[string(p.Identifier)] = p
-		}
-
-		newPeerMap := make(map[string]domain.Peer)
-		for _, p := range peers {
-			if !p.IsDisabled() {
-				newPeerMap[string(p.Identifier)] = p
-			}
-		}
-
-		// Count all active peers loaded from DB
-		totalLoaded += len(newPeerMap)
-
-		// Remove peers that are no longer in the database
-		for id := range existingPeerMap {
-			if _, exists := newPeerMap[id]; !exists {
-				if err := m.wg.RemovePeer(ctx, string(in.Identifier), id); err != nil {
-					slog.ErrorContext(ctx, "failed to remove peer", "peer", id, "iface", in.Identifier, "err", err)
-				}
-				applied++
-			}
-		}
-
-		// Add or update peers - batch collect all peers to update
-		peersToUpdate := make([]domain.Peer, 0, len(newPeerMap))
-		for id, peer := range newPeerMap {
-			if existingPeer, exists := existingPeerMap[id]; !exists || !existingPeer.Equals(peer) {
-				peersToUpdate = append(peersToUpdate, peer)
-			}
-		}
-
-		// Apply all peers as batch to reduce syscalls (especially on startup)
-		if len(peersToUpdate) > 0 {
-			slog.Debug("syncing peers batch", "iface", in.Identifier, "count", len(peersToUpdate))
-			if err := m.applyPeers(ctx, peersToUpdate); err != nil {
-				slog.ErrorContext(ctx, "failed to apply peers batch", "iface", in.Identifier, "count", len(peersToUpdate), "err", err)
-			}
-			applied += len(peersToUpdate)
-		}
+		loaded += count
 	}
-
-	slog.Info("[WIREGUARD] startup sync stats", "total_loaded", totalLoaded, "changes_applied", applied)
-	return totalLoaded, nil
+	return loaded, nil
 }
 
 func (m Manager) replacePeers(ctx context.Context, iface domain.InterfaceIdentifier, peers []domain.Peer) error {
@@ -167,23 +105,7 @@ func isNoSuchFile(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "file does not exist")
 }
 
-// SyncAllPeersFromDBWithLock syncs all peers from database using distributed lock
-// Only one node acquires the lock and performs the sync to prevent database contention
-func (m Manager) SyncAllPeersFromDBWithLock(ctx context.Context, nodeID string) (int, error) {
-	if err := domain.ValidateAdminAccessRights(ctx); err != nil {
-		return 0, err
-	}
-
-	// Attempt to acquire distributed lock
-	type syncerWithLock interface {
-		SyncAllPeersFromDBWithLock(context.Context, string) (int, error)
-	}
-
-	if v, ok := any(m.db).(syncerWithLock); ok {
-		return v.SyncAllPeersFromDBWithLock(ctx, nodeID)
-	}
-
-	// Fallback to regular sync without lock
-	slog.Warn("[SYNC] SyncAllPeersFromDBWithLock called but db doesn't support locks, using regular sync", "node_id", nodeID)
+// Applying peers is node-local; it must not be skipped by a cluster-wide DB lock.
+func (m Manager) SyncAllPeersFromDBWithLock(ctx context.Context, _ string) (int, error) {
 	return m.SyncAllPeersFromDB(ctx)
 }

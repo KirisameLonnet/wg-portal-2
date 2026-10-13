@@ -11,6 +11,8 @@ import (
 )
 
 type PeerServicePeerManagerRepo interface {
+	SyncPeer(context.Context, domain.PeerIdentifier) error
+	SyncAllPeersFromDB(context.Context) (int, error)
 	GetPeer(ctx context.Context, id domain.PeerIdentifier) (*domain.Peer, error)
 	GetUserPeers(ctx context.Context, id domain.UserIdentifier) ([]domain.Peer, error)
 	GetPeersByDisplayName(ctx context.Context, displayName string) ([]domain.Peer, error)
@@ -194,34 +196,17 @@ func (s PeerService) Delete(ctx context.Context, id domain.PeerIdentifier) error
 	return nil
 }
 
-func (s *PeerService) SyncAllPeersFromDB(ctx context.Context) (int, error) {
-	type syncer interface {
-		SyncAllPeersFromDB(context.Context) (int, error)
+func (s *PeerService) SyncPeer(ctx context.Context, id domain.PeerIdentifier) error {
+	if err := domain.ValidateAdminAccessRights(ctx); err != nil {
+		return err
 	}
-	if v, ok := any(s.peers).(syncer); ok {
-		return v.SyncAllPeersFromDB(ctx)
-	}
-
-	type syncerErrOnly interface {
-		SyncAllPeersFromDB(context.Context) error
-	}
-	if v, ok := any(s.peers).(syncerErrOnly); ok {
-		if err := v.SyncAllPeersFromDB(ctx); err != nil {
-			return 0, err
-		}
-		return 0, nil
-	}
-
-	return 0, fmt.Errorf("sync not supported by current peers backend")
+	return s.peers.SyncPeer(ctx, id)
 }
 
-func (s *PeerService) SyncAllPeersFromDBWithLock(ctx context.Context, nodeID string) (int, error) {
-	type syncerWithLock interface {
-		SyncAllPeersFromDBWithLock(context.Context, string) (int, error)
-	}
-	if v, ok := any(s.peers).(syncerWithLock); ok {
-		return v.SyncAllPeersFromDBWithLock(ctx, nodeID)
-	}
+func (s *PeerService) SyncAllPeersFromDB(ctx context.Context) (int, error) {
+	return s.peers.SyncAllPeersFromDB(ctx)
+}
 
-	return 0, fmt.Errorf("sync with lock not supported by current peers backend")
+func (s *PeerService) SyncAllPeersFromDBWithLock(ctx context.Context, _ string) (int, error) {
+	return s.peers.SyncAllPeersFromDB(ctx)
 }

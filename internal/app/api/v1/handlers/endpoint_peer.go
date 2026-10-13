@@ -16,6 +16,7 @@ import (
 )
 
 type PeerService interface {
+	SyncPeer(context.Context, domain.PeerIdentifier) error
 	GetForInterface(context.Context, domain.InterfaceIdentifier) ([]domain.Peer, error)
 	GetForUser(context.Context, domain.UserIdentifier) ([]domain.Peer, error)
 	GetById(context.Context, domain.PeerIdentifier) (*domain.Peer, error)
@@ -498,64 +499,19 @@ func (e PeerEndpoint) handleSyncPost() http.HandlerFunc {
 		// Check if this is a peer-specific sync (from fanout peer event)
 		// or full sync (from periodic interface event or startup)
 		peerID := r.URL.Query().Get("peer_id")
-		eventType := r.URL.Query().Get("event") // "created", "updated", or "deleted"
-		noEcho := r.Header.Get("X-WGP-NoEcho") == "1"
 
 		if peerID != "" {
-			// Peer-specific sync: sync only this one peer to local WireGuard
-			slog.Info("/api/v1/peer/sync: peer-specific sync",
-				"peer_id", peerID, "event", eventType, "node_id", nodeID, "from_fanout", noEcho)
-
-			// Get the specific peer from database
-			peer, err := e.peers.GetById(ctx, domain.PeerIdentifier(peerID))
-			if err != nil {
-				// Peer not found - this is normal for deletion events (peer already deleted)
-				// Return 204 No Content instead of 404 error
-				slog.Debug("/api/v1/peer/sync: peer not found (already deleted)",
-					"peer_id", peerID, "event", eventType, "error", err)
-
-				// If this is a deletion event, trigger local deletion
-				if eventType == "deleted" {
-					slog.Info("/api/v1/peer/sync: triggering local deletion event for missing peer",
-						"peer_id", peerID)
-					e.bus.Publish(app.TopicPeerSyncedLocal, domain.PeerIdentifier(peerID))
-				}
-				respond.Status(w, http.StatusNoContent)
+			if err := e.peers.SyncPeer(ctx, domain.PeerIdentifier(peerID)); err != nil {
+				slog.Error("peer sync failed", "peer_id", peerID, "error", err)
+				status, model := ParseServiceError(err)
+				respond.JSON(w, status, model)
 				return
 			}
-
-			// Publish to local sync event (NOT fanned out by fanout subscriber)
-			// This triggers local WireGuard manager to sync the peer without creating a feedback loop
-			//
-			// Key difference from TopicPeerCreatedSync:
-			// - TopicPeerCreatedSync: Published by creation handler, triggers fanout
-			// - TopicPeerSyncedLocal: Published by HTTP endpoint, does NOT trigger fanout
-			//
-			// Flow:
-			// 1. User creates peer on Node A
-			// 2. Peer saved to replicated database
-			// 3. peer:created:sync published on Node A
-			// 4. Node A's WireGuard manager handles (adds to WG)
-			// 5. Node A's fanout sends HTTP to nodes B-Z with X-WGP-NoEcho=1
-			// 6. Node B HTTP endpoint receives call, publishes TopicPeerSyncedLocal
-			// 7. Node B's WireGuard manager handles TopicPeerSyncedLocal (adds to WG)
-			// 8. fanout does NOT re-fanout(doesn't subscribe to TopicPeerSyncedLocal)
-			// 9. Result: No loop, all nodes have peer
-			slog.Debug("/api/v1/peer/sync: publishing local sync event (breaks fanout loop)",
-				"peer_id", peerID, "event", eventType, "interface", peer.InterfaceIdentifier)
-
-			e.bus.Publish(app.TopicPeerSyncedLocal, peer.Identifier)
-
-			slog.Info("/api/v1/peer/sync: peer-specific sync completed",
-				"peer_id", peerID, "event", eventType, "interface", peer.InterfaceIdentifier,
-				"from_fanout", noEcho)
-
-			respond.JSON(w, http.StatusOK, map[string]any{"synced": 1, "peer_id": peerID, "event": eventType})
+			respond.JSON(w, http.StatusOK, map[string]any{"synced": 1, "peer_id": peerID})
 			return
 		}
 
-		// Full sync: use distributed lock to ensure only one node syncs at a time
-		// This prevents database contention and 504 Gateway Timeout cascades
+		// Full sync applies only local configuration differences.
 		count, err := e.peers.SyncAllPeersFromDBWithLock(ctx, nodeID)
 		if err != nil {
 			slog.Error("/api/v1/peer/sync: SyncAllPeersFromDBWithLock failed", "error", err, "node_id", nodeID)
@@ -564,22 +520,6 @@ func (e PeerEndpoint) handleSyncPost() http.HandlerFunc {
 		}
 
 		slog.Info("/api/v1/peer/sync: full sync completed", "synced", count, "node_id", nodeID)
-
-		// Publish interface update events ONLY if fanout is enabled
-		// If X-WGP-NoEcho header is set, NoFanout is true, so skip events to prevent feedback loop
-		// (the remote fanout node is just syncing the database, not requesting config updates)
-		if !app.NoFanout(ctx) {
-			interfaces, err := e.peers.GetAllInterfaces(ctx)
-			if err != nil {
-				slog.Warn("failed to get interfaces for update events", "error", err)
-				// Fallback to hardcoded interface if we can't get interfaces
-				e.publish(app.TopicPeerInterfaceUpdated, domain.InterfaceIdentifier("wg0"))
-			} else {
-				for _, iface := range interfaces {
-					e.publish(app.TopicPeerInterfaceUpdated, domain.InterfaceIdentifier(iface.Identifier))
-				}
-			}
-		}
 
 		respond.JSON(w, http.StatusOK, map[string]any{"synced": count})
 	}

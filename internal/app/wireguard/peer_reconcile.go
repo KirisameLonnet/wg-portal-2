@@ -9,13 +9,14 @@ import (
 )
 
 // StartPeerReconciliation periodically repairs missed fanout events using the
-// existing local peer sync handler. Start it after interface initialization.
+// existing peer diff. Start it after interface initialization.
 func (m Manager) StartPeerReconciliation(ctx context.Context) {
 	interval := m.cfg.Core.PeerReconcileInterval
 	if !m.cfg.Core.Fanout.Enabled || interval <= 0 {
 		return
 	}
 	go func() {
+		m.reconcilePeers(ctx)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -30,6 +31,8 @@ func (m Manager) StartPeerReconciliation(ctx context.Context) {
 }
 
 func (m Manager) reconcilePeers(ctx context.Context) {
+	m.peerSyncMu.Lock()
+	defer m.peerSyncMu.Unlock()
 	interfaces, err := m.db.GetAllInterfaces(ctx)
 	if err != nil {
 		slog.Error("failed to list interfaces for peer reconciliation", "error", err)
@@ -38,7 +41,13 @@ func (m Manager) reconcilePeers(ctx context.Context) {
 	for _, iface := range interfaces {
 		// An empty backend identifies a local interface in the v1 API.
 		if iface.Backend == "" || iface.Backend == config.LocalBackendName {
-			m.handlePeerInterfaceUpdatedEvent(iface.Identifier)
+			peers, err := m.db.GetInterfacePeers(ctx, iface.Identifier)
+			if err == nil {
+				_, err = m.syncInterfacePeers(ctx, iface, peers)
+			}
+			if err != nil {
+				slog.Error("failed to reconcile peers", "interface", iface.Identifier, "error", err)
+			}
 		}
 	}
 }
